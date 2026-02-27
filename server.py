@@ -4,7 +4,7 @@ import os
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from pdf_tiler import render_overview, render_tile, render_tile_as_pdf, get_page_count as _get_page_count, extract_tile_text, analyze_page as _analyze_page
+from pdf_tiler import render_overview, render_tile, render_tile_as_pdf, get_page_count as _get_page_count, extract_tile_text, analyze_page as _analyze_page, get_page_structure as _get_page_structure
 from scaffold import add_grid_overlay
 
 mcp = FastMCP(
@@ -16,8 +16,9 @@ mcp = FastMCP(
 
 1. **get_page_count** → 페이지 수·크기 파악
 2. **suggest_grid** → 적절한 grid_rows/grid_cols 추천 받기
-3. **get_overview** → 추천 그리드 값으로 레이아웃 파악
-4. **get_tile** / **get_tile_as_pdf** / **get_tile_text** → 필요한 셀 정밀 분석
+3. **get_structure** → 셀별 콘텐츠 사전 파악 + TOC 확인
+4. **get_overview** → 레이아웃 시각적 확인 (선택적)
+5. **get_tile** / **get_tile_as_pdf** / **get_tile_text** → 필요한 셀만 선택 분석
 
 ## 핵심 원칙
 
@@ -209,6 +210,43 @@ def get_tile_text(
         overlap: 타일 경계 확장 비율 (기본 0.0 — get_tile과 동일한 값을 사용하세요)
     """
     result = extract_tile_text(pdf_path, cell_idx, grid_rows, grid_cols, page_idx=page_idx, overlap=overlap)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_structure(
+    pdf_path: str,
+    grid_rows: int = 8,
+    grid_cols: int = 8,
+    page_idx: int = 0,
+) -> str:
+    """
+    셀별 텍스트/이미지 유무와 PDF 목차를 JSON으로 반환합니다.
+
+    get_overview 이전 또는 이후에 호출하면 어느 셀을 get_tile로 분석할지
+    사전에 파악할 수 있어 불필요한 호출을 줄일 수 있습니다.
+    grid_rows, grid_cols는 get_overview와 동일한 값을 사용해야 셀 번호가 일치합니다.
+
+    반환값 구조:
+    - cells: 셀 번호 → {has_text, has_image, text_preview} 매핑
+      - has_text: 텍스트 블록 존재 여부
+      - has_image: 이미지 블록 존재 여부
+      - text_preview: 셀 내 첫 텍스트 미리보기 (최대 80자)
+    - toc: PDF 목차 [[level, title, page], ...] (없으면 빈 리스트)
+
+    활용 방법:
+    - has_text=false, has_image=false → 빈 셀, 건너뜀
+    - has_text=true → get_tile_text로 빠른 텍스트 추출 우선
+    - has_image=true → get_tile(이미지) 또는 get_tile_as_pdf로 시각 분석
+    - toc → 전체 문서 구조를 파악하여 관심 페이지로 바로 이동
+
+    Args:
+        pdf_path: PDF 파일 절대 경로
+        grid_rows: 그리드 행 수 (get_overview와 동일하게, 기본 8)
+        grid_cols: 그리드 열 수 (get_overview와 동일하게, 기본 8)
+        page_idx: 페이지 번호 (0부터 시작, 기본 0)
+    """
+    result = _get_page_structure(pdf_path, grid_rows, grid_cols, page_idx)
     return json.dumps(result, ensure_ascii=False)
 
 

@@ -229,6 +229,62 @@ def render_tile_as_pdf(
         return out_path.read_bytes()
 
 
+def get_page_structure(pdf_path: str, rows: int, cols: int, page_idx: int = 0) -> dict:
+    """
+    셀별 텍스트/이미지 유무와 PDF 목차(TOC)를 반환한다.
+
+    각 셀에 대해 has_text, has_image, text_preview를 계산하여
+    LLM이 불필요한 get_tile 호출을 최소화할 수 있도록 한다.
+    """
+    doc = fitz.open(pdf_path)
+    page = doc[page_idx]
+    page_w = page.rect.width
+    page_h = page.rect.height
+    tile_w = page_w / cols
+    tile_h = page_h / rows
+
+    blocks = page.get_text("dict")["blocks"]
+    toc = doc.get_toc()
+
+    cells = {}
+    for cell_idx in range(rows * cols):
+        row, col = divmod(cell_idx, cols)
+        cell_rect = fitz.Rect(
+            col * tile_w, row * tile_h,
+            (col + 1) * tile_w, (row + 1) * tile_h,
+        )
+
+        has_text = False
+        has_image = False
+        text_preview = ""
+
+        for block in blocks:
+            block_rect = fitz.Rect(block["bbox"])
+            if not cell_rect.intersects(block_rect):
+                continue
+            if block["type"] == 0:  # 텍스트
+                has_text = True
+                if not text_preview:
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            text_preview += span.get("text", "")
+                            if len(text_preview) >= 80:
+                                break
+                        if len(text_preview) >= 80:
+                            break
+            elif block["type"] == 1:  # 이미지
+                has_image = True
+
+        cells[cell_idx] = {
+            "has_text": has_text,
+            "has_image": has_image,
+            "text_preview": text_preview[:80].strip(),
+        }
+
+    doc.close()
+    return {"cells": cells, "toc": toc}
+
+
 def get_page_size(pdf_path: str, page_idx: int = 0) -> tuple[float, float]:
     """PDF 페이지의 가로×세로 크기를 포인트 단위로 반환."""
     doc = fitz.open(pdf_path)
