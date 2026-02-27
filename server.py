@@ -4,7 +4,7 @@ import os
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from pdf_tiler import render_overview, render_tile, render_tile_as_pdf, get_page_count as _get_page_count, extract_tile_text
+from pdf_tiler import render_overview, render_tile, render_tile_as_pdf, get_page_count as _get_page_count, extract_tile_text, analyze_page as _analyze_page
 from scaffold import add_grid_overlay
 
 mcp = FastMCP(
@@ -14,10 +14,10 @@ mcp = FastMCP(
 
 ## 권장 워크플로우
 
-1. **get_page_count** 호출 → 총 페이지 수와 각 페이지 크기 파악 (다중 페이지 문서일 경우)
-2. **get_overview** 호출 → 문서 전체를 저해상도로 확인하고 번호가 매겨진 그리드로 레이아웃 파악
-3. 분석이 필요한 셀 번호 식별
-4. **get_tile** 또는 **get_tile_as_pdf** 호출 → 해당 셀만 고해상도로 추출하여 정밀 분석
+1. **get_page_count** → 페이지 수·크기 파악
+2. **suggest_grid** → 적절한 grid_rows/grid_cols 추천 받기
+3. **get_overview** → 추천 그리드 값으로 레이아웃 파악
+4. **get_tile** / **get_tile_as_pdf** / **get_tile_text** → 필요한 셀 정밀 분석
 
 ## 핵심 원칙
 
@@ -40,6 +40,36 @@ def get_page_count(pdf_path: str) -> str:
         pdf_path: PDF 파일 절대 경로
     """
     return json.dumps(_get_page_count(pdf_path), ensure_ascii=False)
+
+
+@mcp.tool()
+def suggest_grid(
+    pdf_path: str,
+    page_idx: int = 0,
+    target_tile_pt: int = 1500,
+) -> str:
+    """
+    페이지 크기와 텍스트 밀도를 분석하여 적절한 그리드 크기를 추천합니다.
+
+    get_page_count 다음, get_overview 이전에 호출하면 최적의 grid_rows/grid_cols를
+    결정하는 데 도움이 됩니다. 특히 문서가 매우 크거나 텍스트가 밀집된 경우 유용합니다.
+
+    반환 필드:
+    - page_size_pt: 페이지 크기 (포인트 단위)
+    - page_size_mm: 페이지 크기 (밀리미터 단위)
+    - text_block_count: 텍스트 블록 수
+    - total_chars: 전체 문자 수
+    - image_block_count: 이미지 블록 수
+    - text_density: 텍스트 밀도 (문자 수 / 페이지 면적)
+    - suggested_grid: 추천 그리드 크기 {"rows": ..., "cols": ...}
+    - suggested_tile_size_pt: 추천 그리드 사용 시 타일 크기 (포인트 단위)
+
+    Args:
+        pdf_path: PDF 파일 절대 경로
+        page_idx: 분석할 페이지 번호 (0부터 시작, 기본 0)
+        target_tile_pt: 목표 타일 크기 포인트 (기본 1500)
+    """
+    return json.dumps(_analyze_page(pdf_path, page_idx=page_idx, target_tile_pt=target_tile_pt), ensure_ascii=False)
 
 
 @mcp.tool()

@@ -1,9 +1,86 @@
 import shutil
 import subprocess
 import tempfile
+from math import ceil
 from pathlib import Path
 
 import fitz  # PyMuPDF
+
+
+def _round_grid(n: int) -> int:
+    """후보 목록 중 n 이상인 최솟값 반환."""
+    candidates = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64]
+    for c in candidates:
+        if c >= n:
+            return c
+    return candidates[-1]
+
+
+def analyze_page(
+    pdf_path: str,
+    page_idx: int = 0,
+    target_tile_pt: int = 1500,
+) -> dict:
+    """
+    페이지 크기·텍스트 밀도를 분석하고 적절한 그리드 크기를 추천한다.
+
+    Args:
+        pdf_path: PDF 파일 절대 경로
+        page_idx: 분석할 페이지 번호 (0부터 시작)
+        target_tile_pt: 목표 타일 크기 (포인트 단위, 기본 1500)
+
+    Returns:
+        page_size_pt, page_size_mm, text_block_count, total_chars,
+        image_block_count, text_density, suggested_grid, suggested_tile_size_pt
+    """
+    doc = fitz.open(pdf_path)
+    page = doc[page_idx]
+    rect = page.rect
+    page_w = rect.width
+    page_h = rect.height
+
+    text_dict = page.get_text("dict")
+    blocks = text_dict.get("blocks", [])
+
+    text_blocks = [b for b in blocks if b.get("type") == 0]
+    image_blocks = [b for b in blocks if b.get("type") == 1]
+
+    total_chars = sum(
+        len(span.get("text", ""))
+        for block in text_blocks
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+    )
+
+    doc.close()
+
+    area = page_w * page_h
+    density = total_chars / area if area > 0 else 0.0
+
+    base_cols = ceil(page_w / target_tile_pt)
+    base_rows = ceil(page_h / target_tile_pt)
+
+    if density > 0.01:
+        base_cols = ceil(base_cols * 1.5)
+        base_rows = ceil(base_rows * 1.5)
+
+    suggested_rows = _round_grid(base_rows)
+    suggested_cols = _round_grid(base_cols)
+
+    PT_TO_MM = 0.3528
+    return {
+        "page_size_pt": {"width": page_w, "height": page_h},
+        "page_size_mm": {"width": round(page_w * PT_TO_MM, 1), "height": round(page_h * PT_TO_MM, 1)},
+        "text_block_count": len(text_blocks),
+        "total_chars": total_chars,
+        "image_block_count": len(image_blocks),
+        "text_density": density,
+        "suggested_grid": {"rows": suggested_rows, "cols": suggested_cols},
+        "suggested_tile_size_pt": {
+            "width": round(page_w / suggested_cols, 1),
+            "height": round(page_h / suggested_rows, 1),
+        },
+    }
 
 
 def get_page_count(pdf_path: str) -> dict:
