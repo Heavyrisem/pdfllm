@@ -4,7 +4,7 @@ import tempfile
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from pdf_tiler import render_overview, render_tile, render_tile_as_pdf, get_page_count as _get_page_count, extract_tile_text, analyze_page as _analyze_page, get_page_structure as _get_page_structure
+from pdf_tiler import render_overview, render_tile, render_tile_as_pdf, get_page_count as _get_page_count, extract_tile_text, analyze_page as _analyze_page, get_page_structure as _get_page_structure, search_cells as _search_cells
 from scaffold import add_grid_overlay
 
 mcp = FastMCP(
@@ -286,6 +286,41 @@ def get_structure(
     """
     _validate_grid(grid_rows, grid_cols)
     result = _get_page_structure(pdf_path, grid_rows, grid_cols, page_idx, overlap=overlap, include_empty=include_empty)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+def find_cells(
+    pdf_path: str,
+    query: str,
+    grid_rows: int = 8,
+    grid_cols: int = 8,
+    page_idx: int = 0,
+    overlap: float = 0.0,
+    case_sensitive: bool = False,
+) -> str:
+    """
+    특정 문자열이 포함된 셀 번호 목록을 반환합니다.
+
+    LLM이 키워드가 어느 셀에 있는지 한 번에 찾을 수 있어,
+    모든 셀을 get_tile_text로 개별 호출하는 비효율을 줄입니다.
+    반환된 matched_cells 번호로 get_tile_text를 호출하여 상세 내용을 확인하세요.
+
+    반환값 구조:
+    - query: 검색한 문자열
+    - matched_cells: 해당 문자열이 포함된 셀 번호 목록
+
+    Args:
+        pdf_path: PDF 파일 절대 경로
+        query: 검색할 문자열
+        grid_rows: 그리드 행 수 (get_overview와 동일하게, 기본 8)
+        grid_cols: 그리드 열 수 (get_overview와 동일하게, 기본 8)
+        page_idx: 페이지 번호 (0부터 시작, 기본 0)
+        overlap: 타일 경계 확장 비율 (기본 0.0)
+        case_sensitive: 대소문자 구분 여부 (기본 False — 구분 안 함)
+    """
+    _validate_grid(grid_rows, grid_cols)
+    result = _search_cells(pdf_path, query, grid_rows, grid_cols, page_idx=page_idx, overlap=overlap, case_sensitive=case_sensitive)
     return json.dumps(result, ensure_ascii=False)
 
 

@@ -5,6 +5,18 @@ from math import ceil
 from pathlib import Path
 
 import fitz  # PyMuPDF
+import pdfplumber
+
+
+def _extract_text_clip(pdf_path: str, clip: fitz.Rect, page_idx: int) -> str:
+    """pdfplumber로 clip 영역의 텍스트 추출. 실패 시 빈 문자열 반환."""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            page = pdf.pages[page_idx]
+            cropped = page.crop((clip.x0, clip.y0, clip.x1, clip.y1))
+            return cropped.extract_text() or ""
+    except Exception:
+        return ""
 
 
 def _round_grid(n: int) -> int:
@@ -233,6 +245,19 @@ def render_tile_as_pdf(
         return out_path.read_bytes()
 
 
+def _words_in_rect(words: list, rx0: float, ry0: float, rx1: float, ry1: float, max_chars: int = 80) -> str:
+    """pdfplumber extract_words() 결과에서 주어진 rect 안의 단어를 조합하여 반환."""
+    result = []
+    total = 0
+    for w in words:
+        if w["x0"] < rx1 and w["x1"] > rx0 and w["top"] < ry1 and w["bottom"] > ry0:
+            result.append(w["text"])
+            total += len(w["text"]) + 1
+            if total >= max_chars:
+                break
+    return " ".join(result)
+
+
 def get_page_structure(
     pdf_path: str,
     rows: int,
@@ -261,31 +286,59 @@ def get_page_structure(
 
     blocks = page.get_text("dict")["blocks"]
     toc = doc.get_toc()
+    doc.close()
+
+    tile_w = page_w / cols
+    tile_h = page_h / rows
+
+    # overlap padding 계산 (셀 크기 기준 평균값 사용)
+    pad_x = overlap * tile_w
+    pad_y = overlap * tile_h
+
+    # 셀 플래그 초기화
+    total_cells = rows * cols
+    cell_flags = [{"has_text": False, "has_image": False} for _ in range(total_cells)]
+
+    # ① 블록→셀 역방향 버케팅: 블록을 한 번만 순회하여 해당 셀 범위에 플래그 설정
+    for block in blocks:
+        bx0, by0, bx1, by1 = block["bbox"]
+        is_text = block["type"] == 0
+        is_image = block["type"] == 1
+
+        if not (is_text or is_image):
+            continue
+
+        # overlap을 고려하여 블록이 겹칠 수 있는 셀 범위 계산
+        col_start = max(0, int((bx0 - pad_x) / tile_w))
+        col_end   = min(cols - 1, int((bx1 + pad_x) / tile_w))
+        row_start = max(0, int((by0 - pad_y) / tile_h))
+        row_end   = min(rows - 1, int((by1 + pad_y) / tile_h))
+
+        for r in range(row_start, row_end + 1):
+            for c in range(col_start, col_end + 1):
+                cidx = r * cols + c
+                if is_text:
+                    cell_flags[cidx]["has_text"] = True
+                if is_image:
+                    cell_flags[cidx]["has_image"] = True
+
+    # ② pdfplumber를 1회만 열어 전체 단어 목록 추출
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            pl_words = pdf.pages[page_idx].extract_words()
+    except Exception:
+        pl_words = []
 
     cells = {}
-    for cell_idx in range(rows * cols):
-        cell_rect, _, _, _, _ = _calc_cell_clip(page_w, page_h, cell_idx, rows, cols, overlap)
-
-        has_text = False
-        has_image = False
+    for cell_idx in range(total_cells):
+        flags = cell_flags[cell_idx]
+        has_text = flags["has_text"]
+        has_image = flags["has_image"]
         text_preview = ""
 
-        for block in blocks:
-            block_rect = fitz.Rect(block["bbox"])
-            if not cell_rect.intersects(block_rect):
-                continue
-            if block["type"] == 0:  # 텍스트
-                has_text = True
-                if not text_preview:
-                    for line in block.get("lines", []):
-                        for span in line.get("spans", []):
-                            text_preview += span.get("text", "")
-                            if len(text_preview) >= 80:
-                                break
-                        if len(text_preview) >= 80:
-                            break
-            elif block["type"] == 1:  # 이미지
-                has_image = True
+        if has_text:
+            cell_rect, _, _, _, _ = _calc_cell_clip(page_w, page_h, cell_idx, rows, cols, overlap)
+            text_preview = _words_in_rect(pl_words, cell_rect.x0, cell_rect.y0, cell_rect.x1, cell_rect.y1)
 
         cells[cell_idx] = {
             "has_text": has_text,
@@ -296,7 +349,6 @@ def get_page_structure(
     if not include_empty:
         cells = {k: v for k, v in cells.items() if v["has_text"] or v["has_image"]}
 
-    doc.close()
     return {"cells": cells, "toc": toc}
 
 
@@ -318,32 +370,46 @@ def extract_tile_text(
     rect = page.rect
 
     clip, _, _, _, _ = _calc_cell_clip(rect.width, rect.height, cell_idx, rows, cols, overlap)
+
+    if format == "text":
+        doc.close()
+        text = _extract_text_clip(pdf_path, clip, page_idx)
+        return {
+            "text": text,
+            "cell_idx": cell_idx,
+            "clip_rect": [clip.x0, clip.y0, clip.x1, clip.y1],
+        }
+
+    # format == "compact": bbox는 fitz 유지, text는 pdfplumber로 추출
     text_dict = page.get_text("dict", clip=clip)
     doc.close()
 
     # type=0: 텍스트 블록, type=1: 이미지 블록 (bytes 포함으로 JSON 직렬화 불가)
     text_blocks = [b for b in text_dict.get("blocks", []) if b.get("type") == 0]
 
-    if format == "text":
-        lines_text = []
-        for block in text_blocks:
-            for line in block.get("lines", []):
-                line_text = "".join(span.get("text", "") for span in line.get("spans", []))
-                if line_text.strip():
-                    lines_text.append(line_text)
-        return {
-            "text": "\n".join(lines_text),
-            "cell_idx": cell_idx,
-            "clip_rect": [clip.x0, clip.y0, clip.x1, clip.y1],
-        }
+    # pdfplumber로 단어 단위 텍스트 추출 (bbox 기반 매핑용)
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            pl_page = pdf.pages[page_idx]
+            pl_words = pl_page.crop((clip.x0, clip.y0, clip.x1, clip.y1)).extract_words()
+    except Exception:
+        pl_words = []
 
-    # format == "compact": bbox + text만 유지
+    def _find_word_text(span_bbox: tuple) -> str:
+        """span bbox와 겹치는 pdfplumber 단어들을 조합하여 반환."""
+        sx0, sy0, sx1, sy1 = span_bbox
+        matched_words = [
+            w["text"] for w in pl_words
+            if w["x0"] < sx1 and w["x1"] > sx0 and w["top"] < sy1 and w["bottom"] > sy0
+        ]
+        return " ".join(matched_words)
+
     compact_blocks = []
     for block in text_blocks:
         compact_lines = []
         for line in block.get("lines", []):
             compact_spans = [
-                {"text": s.get("text", ""), "bbox": s["bbox"]}
+                {"text": _find_word_text(s["bbox"]), "bbox": s["bbox"]}
                 for s in line.get("spans", [])
             ]
             compact_lines.append({"bbox": line["bbox"], "spans": compact_spans})
@@ -354,3 +420,40 @@ def extract_tile_text(
         "cell_idx": cell_idx,
         "clip_rect": [clip.x0, clip.y0, clip.x1, clip.y1],
     }
+
+
+def search_cells(
+    pdf_path: str,
+    query: str,
+    rows: int,
+    cols: int,
+    page_idx: int = 0,
+    overlap: float = 0.0,
+    case_sensitive: bool = False,
+) -> dict:
+    """특정 문자열이 포함된 셀 번호 목록을 반환."""
+    doc = fitz.open(pdf_path)
+    page = doc[page_idx]
+    page_w = page.rect.width
+    page_h = page.rect.height
+    doc.close()
+
+    # pdfplumber를 1회만 열어 전체 단어 목록 추출
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            pl_words = pdf.pages[page_idx].extract_words()
+    except Exception:
+        pl_words = []
+
+    search_query = query if case_sensitive else query.lower()
+
+    matched = []
+    for cell_idx in range(rows * cols):
+        cell_rect, _, _, _, _ = _calc_cell_clip(page_w, page_h, cell_idx, rows, cols, overlap)
+        cell_text = _words_in_rect(pl_words, cell_rect.x0, cell_rect.y0, cell_rect.x1, cell_rect.y1, max_chars=10000)
+        if not case_sensitive:
+            cell_text = cell_text.lower()
+        if search_query in cell_text:
+            matched.append(cell_idx)
+
+    return {"query": query, "matched_cells": matched}
