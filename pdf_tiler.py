@@ -9,12 +9,23 @@ import pdfplumber
 
 
 def _extract_text_clip(pdf_path: str, clip: fitz.Rect, page_idx: int) -> str:
-    """pdfplumber로 clip 영역의 텍스트 추출. 실패 시 빈 문자열 반환."""
+    """pdfplumber로 clip 영역의 텍스트 추출. 실패 시 PyMuPDF fallback."""
     try:
         with pdfplumber.open(pdf_path) as pdf:
             page = pdf.pages[page_idx]
             cropped = page.crop((clip.x0, clip.y0, clip.x1, clip.y1))
-            return cropped.extract_text() or ""
+            text = cropped.extract_text() or ""
+        if text.strip():
+            return text
+    except Exception:
+        pass
+
+    # fallback: PyMuPDF (pdfplumber 실패 또는 빈 결과 시에만 실행)
+    try:
+        doc = fitz.open(pdf_path)
+        text = doc[page_idx].get_text("text", clip=clip)
+        doc.close()
+        return text or ""
     except Exception:
         return ""
 
@@ -334,11 +345,13 @@ def get_page_structure(
         flags = cell_flags[cell_idx]
         has_text = flags["has_text"]
         has_image = flags["has_image"]
-        text_preview = ""
 
-        if has_text:
-            cell_rect, _, _, _, _ = _calc_cell_clip(page_w, page_h, cell_idx, rows, cols, overlap)
-            text_preview = _words_in_rect(pl_words, cell_rect.x0, cell_rect.y0, cell_rect.x1, cell_rect.y1)
+        cell_rect, _, _, _, _ = _calc_cell_clip(page_w, page_h, cell_idx, rows, cols, overlap)
+        text_preview = _words_in_rect(pl_words, cell_rect.x0, cell_rect.y0, cell_rect.x1, cell_rect.y1)
+
+        # pdfplumber words로 has_text 이중 검증 (PyMuPDF가 놓친 경우 보완)
+        if text_preview:
+            has_text = True
 
         cells[cell_idx] = {
             "has_text": has_text,
@@ -372,8 +385,12 @@ def extract_tile_text(
     clip, _, _, _, _ = _calc_cell_clip(rect.width, rect.height, cell_idx, rows, cols, overlap)
 
     if format == "text":
+        # doc이 열린 상태에서 PyMuPDF 텍스트 미리 추출 (fallback용, 이중 open 방지)
+        fitz_text = page.get_text("text", clip=clip) or ""
         doc.close()
         text = _extract_text_clip(pdf_path, clip, page_idx)
+        if not text.strip():
+            text = fitz_text
         return {
             "text": text,
             "cell_idx": cell_idx,
@@ -382,10 +399,30 @@ def extract_tile_text(
 
     # format == "compact": bbox는 fitz 유지, text는 pdfplumber로 추출
     text_dict = page.get_text("dict", clip=clip)
-    doc.close()
-
     # type=0: 텍스트 블록, type=1: 이미지 블록 (bytes 포함으로 JSON 직렬화 불가)
     text_blocks = [b for b in text_dict.get("blocks", []) if b.get("type") == 0]
+
+    if not text_blocks:
+        # fallback: get_text("words") — 이미 열린 doc 재사용, 추가 I/O 없음
+        fitz_words = page.get_text("words", clip=clip)
+        doc.close()
+        compact_blocks = []
+        if fitz_words:
+            compact_blocks = [{
+                "bbox": [clip.x0, clip.y0, clip.x1, clip.y1],
+                "lines": [
+                    {"bbox": [w[0], w[1], w[2], w[3]],
+                     "spans": [{"text": w[4], "bbox": [w[0], w[1], w[2], w[3]]}]}
+                    for w in fitz_words
+                ],
+            }]
+        return {
+            "blocks": compact_blocks,
+            "cell_idx": cell_idx,
+            "clip_rect": [clip.x0, clip.y0, clip.x1, clip.y1],
+        }
+
+    doc.close()
 
     # pdfplumber로 단어 단위 텍스트 추출 (bbox 기반 매핑용)
     try:

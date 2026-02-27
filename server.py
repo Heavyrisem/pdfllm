@@ -6,6 +6,7 @@ from mcp.server.fastmcp import FastMCP, Image
 
 from pdf_tiler import render_overview, render_tile, render_tile_as_pdf, get_page_count as _get_page_count, extract_tile_text, analyze_page as _analyze_page, get_page_structure as _get_page_structure, search_cells as _search_cells
 from scaffold import add_grid_overlay
+from monitor import MonitorServer, track_call
 
 mcp = FastMCP(
     "pdfllm",
@@ -49,6 +50,7 @@ def _validate_dpi(dpi: int) -> None:
 
 
 @mcp.tool()
+@track_call("get_page_count")
 def get_page_count(pdf_path: str) -> str:
     """
     PDF의 페이지 수와 각 페이지 크기를 반환합니다.
@@ -63,6 +65,7 @@ def get_page_count(pdf_path: str) -> str:
 
 
 @mcp.tool()
+@track_call("suggest_grid")
 def suggest_grid(
     pdf_path: str,
     page_idx: int = 0,
@@ -93,6 +96,7 @@ def suggest_grid(
 
 
 @mcp.tool()
+@track_call("get_overview")
 def get_overview(
     pdf_path: str,
     grid_rows: int = 8,
@@ -124,6 +128,7 @@ def get_overview(
 
 
 @mcp.tool()
+@track_call("get_tile")
 def get_tile(
     pdf_path: str,
     cell_idx: int,
@@ -158,6 +163,7 @@ def get_tile(
 
 
 @mcp.tool()
+@track_call("get_tile_as_pdf")
 def get_tile_as_pdf(
     pdf_path: str,
     cell_idx: int,
@@ -203,6 +209,7 @@ def get_tile_as_pdf(
 
 
 @mcp.tool()
+@track_call("get_tile_text")
 def get_tile_text(
     pdf_path: str,
     cell_idx: int,
@@ -245,6 +252,7 @@ def get_tile_text(
 
 
 @mcp.tool()
+@track_call("get_structure")
 def get_structure(
     pdf_path: str,
     grid_rows: int = 8,
@@ -290,6 +298,7 @@ def get_structure(
 
 
 @mcp.tool()
+@track_call("find_cells")
 def find_cells(
     pdf_path: str,
     query: str,
@@ -325,4 +334,5 @@ def find_cells(
 
 
 if __name__ == "__main__":
+    MonitorServer().start()
     mcp.run()
