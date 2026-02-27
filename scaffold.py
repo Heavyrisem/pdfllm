@@ -2,6 +2,30 @@ import io
 from PIL import Image, ImageDraw, ImageFont
 
 
+# 플랫폼별 후보 폰트 경로 (앞쪽부터 순서대로 시도)
+_FONT_CANDIDATES = [
+    # macOS
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/Arial.ttf",
+    # Linux (Debian/Ubuntu)
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    # Windows
+    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/segoeui.ttf",
+]
+
+
+def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """플랫폼에 맞는 트루타입 폰트를 로드한다. 없으면 기본 폰트 사용."""
+    for path in _FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, size)
+        except (IOError, OSError):
+            continue
+    return ImageFont.load_default()
+
+
 def add_grid_overlay(
     img_bytes: bytes,
     rows: int,
@@ -22,10 +46,7 @@ def add_grid_overlay(
 
     # 이미지 크기에 비례한 폰트 크기
     font_size = max(10, min(w, h) // (max(rows, cols) * 2))
-    try:
-        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
-    except (IOError, OSError):
-        font = ImageFont.load_default()
+    font = _load_font(font_size)
 
     cell_map: dict[int, tuple[int, int, int, int]] = {}
 

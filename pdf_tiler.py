@@ -16,6 +16,35 @@ def _round_grid(n: int) -> int:
     return candidates[-1]
 
 
+def _calc_cell_clip(
+    page_w: float,
+    page_h: float,
+    cell_idx: int,
+    rows: int,
+    cols: int,
+    overlap: float = 0.0,
+) -> tuple[fitz.Rect, float, float, int, int]:
+    """
+    셀 인덱스로부터 클립 영역(fitz.Rect)과 메타데이터를 계산한다.
+
+    Returns:
+        (clip, tile_w, tile_h, row, col)
+    """
+    row, col = divmod(cell_idx, cols)
+    tile_w = page_w / cols
+    tile_h = page_h / rows
+
+    pad_x = overlap * tile_w
+    pad_y = overlap * tile_h
+
+    x0 = max(0.0, col * tile_w - pad_x)
+    y0 = max(0.0, row * tile_h - pad_y)
+    x1 = min(page_w, (col + 1) * tile_w + pad_x)
+    y1 = min(page_h, (row + 1) * tile_h + pad_y)
+
+    return fitz.Rect(x0, y0, x1, y1), tile_w, tile_h, row, col
+
+
 def analyze_page(
     pdf_path: str,
     page_idx: int = 0,
@@ -113,7 +142,7 @@ def render_tile(
     cell_idx: int,
     rows: int,
     cols: int,
-    dpi: int = 300,
+    dpi: int = 72,
     page_idx: int = 0,
     overlap: float = 0.0,
 ) -> bytes:
@@ -125,24 +154,7 @@ def render_tile(
     page = doc[page_idx]
     rect = page.rect
 
-    row, col = divmod(cell_idx, cols)
-    tile_w = rect.width / cols
-    tile_h = rect.height / rows
-
-    x0 = col * tile_w
-    y0 = row * tile_h
-    x1 = (col + 1) * tile_w
-    y1 = (row + 1) * tile_h
-
-    pad_x = overlap * tile_w
-    pad_y = overlap * tile_h
-
-    clip = fitz.Rect(
-        max(rect.x0, x0 - pad_x),
-        max(rect.y0, y0 - pad_y),
-        min(rect.x1, x1 + pad_x),
-        min(rect.y1, y1 + pad_y),
-    )
+    clip, _, _, _, _ = _calc_cell_clip(rect.width, rect.height, cell_idx, rows, cols, overlap)
 
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = page.get_pixmap(matrix=mat, clip=clip)
@@ -178,24 +190,7 @@ def render_tile_as_pdf(
     page = doc[page_idx]
     rect = page.rect
 
-    row, col = divmod(cell_idx, cols)
-    tile_w = rect.width / cols
-    tile_h = rect.height / rows
-
-    x0 = col * tile_w
-    y0 = row * tile_h
-    x1 = (col + 1) * tile_w
-    y1 = (row + 1) * tile_h
-
-    pad_x = overlap * tile_w
-    pad_y = overlap * tile_h
-
-    clip = fitz.Rect(
-        max(rect.x0, x0 - pad_x),
-        max(rect.y0, y0 - pad_y),
-        min(rect.x1, x1 + pad_x),
-        min(rect.y1, y1 + pad_y),
-    )
+    clip, _, _, _, _ = _calc_cell_clip(rect.width, rect.height, cell_idx, rows, cols, overlap)
 
     with tempfile.TemporaryDirectory() as tmp:
         # 1단계: PyMuPDF로 cropbox 설정된 중간 PDF 생성
@@ -209,50 +204,67 @@ def render_tile_as_pdf(
 
         # 2단계: Ghostscript로 재처리 (미사용 리소스 제거 + 폰트 서브셋)
         out_path = Path(tmp) / "out.pdf"
-        subprocess.run(
-            [
-                gs,
-                "-sDEVICE=pdfwrite",
-                "-dNOPAUSE", "-dBATCH", "-dQUIET",
-                "-dSubsetFonts=true",
-                "-dEmbedAllFonts=true",
-                "-dCompressFonts=true",
-                "-dDownsampleColorImages=false",
-                "-dDownsampleGrayImages=false",
-                "-dDownsampleMonoImages=false",
-                f"-sOutputFile={out_path}",
-                str(mid_path),
-            ],
-            check=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    gs,
+                    "-sDEVICE=pdfwrite",
+                    "-dNOPAUSE", "-dBATCH", "-dQUIET",
+                    "-dSubsetFonts=true",
+                    "-dEmbedAllFonts=true",
+                    "-dCompressFonts=true",
+                    "-dDownsampleColorImages=false",
+                    "-dDownsampleGrayImages=false",
+                    "-dDownsampleMonoImages=false",
+                    f"-sOutputFile={out_path}",
+                    str(mid_path),
+                ],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode(errors="replace").strip()
+            raise RuntimeError(
+                f"Ghostscript가 셀 {cell_idx} 처리에 실패했습니다.\n"
+                f"원인: {stderr or '알 수 없는 오류'}\n"
+                "대안: get_tile 도구를 사용하면 Ghostscript 없이 이미지로 추출할 수 있습니다."
+            ) from None
 
         return out_path.read_bytes()
 
 
-def get_page_structure(pdf_path: str, rows: int, cols: int, page_idx: int = 0) -> dict:
+def get_page_structure(
+    pdf_path: str,
+    rows: int,
+    cols: int,
+    page_idx: int = 0,
+    overlap: float = 0.0,
+    include_empty: bool = False,
+) -> dict:
     """
     셀별 텍스트/이미지 유무와 PDF 목차(TOC)를 반환한다.
 
     각 셀에 대해 has_text, has_image, text_preview를 계산하여
     LLM이 불필요한 get_tile 호출을 최소화할 수 있도록 한다.
+
+    overlap을 지정하면 get_tile/get_tile_text와 동일한 경계 확장 후 검사하므로
+    경계 근처 콘텐츠를 놓치지 않는다.
+
+    주의: toc의 page 필드는 PyMuPDF get_toc() 기준으로 1-indexed이다.
+    page_idx 파라미터(0-indexed)와 1 차이가 있으므로, TOC page 값을
+    page_idx로 사용하려면 1을 빼야 한다.
     """
     doc = fitz.open(pdf_path)
     page = doc[page_idx]
     page_w = page.rect.width
     page_h = page.rect.height
-    tile_w = page_w / cols
-    tile_h = page_h / rows
 
     blocks = page.get_text("dict")["blocks"]
     toc = doc.get_toc()
 
     cells = {}
     for cell_idx in range(rows * cols):
-        row, col = divmod(cell_idx, cols)
-        cell_rect = fitz.Rect(
-            col * tile_w, row * tile_h,
-            (col + 1) * tile_w, (row + 1) * tile_h,
-        )
+        cell_rect, _, _, _, _ = _calc_cell_clip(page_w, page_h, cell_idx, rows, cols, overlap)
 
         has_text = False
         has_image = False
@@ -281,16 +293,11 @@ def get_page_structure(pdf_path: str, rows: int, cols: int, page_idx: int = 0) -
             "text_preview": text_preview[:80].strip(),
         }
 
+    if not include_empty:
+        cells = {k: v for k, v in cells.items() if v["has_text"] or v["has_image"]}
+
     doc.close()
     return {"cells": cells, "toc": toc}
-
-
-def get_page_size(pdf_path: str, page_idx: int = 0) -> tuple[float, float]:
-    """PDF 페이지의 가로×세로 크기를 포인트 단위로 반환."""
-    doc = fitz.open(pdf_path)
-    rect = doc[page_idx].rect
-    doc.close()
-    return rect.width, rect.height
 
 
 def extract_tile_text(
@@ -300,37 +307,50 @@ def extract_tile_text(
     cols: int,
     page_idx: int = 0,
     overlap: float = 0.0,
+    format: str = "text",
 ) -> dict:
     """
     그리드 셀 인덱스에 해당하는 영역의 텍스트를 추출하여 반환.
     render_tile과 동일한 clip 계산 로직을 사용하므로 좌표가 일치합니다.
     """
-    page_w, page_h = get_page_size(pdf_path, page_idx)
-
-    row, col = divmod(cell_idx, cols)
-    tile_w = page_w / cols
-    tile_h = page_h / rows
-
-    x0 = col * tile_w - overlap * tile_w
-    y0 = row * tile_h - overlap * tile_h
-    x1 = x0 + tile_w + 2 * overlap * tile_w
-    y1 = y0 + tile_h + 2 * overlap * tile_h
-
-    x0, y0 = max(0, x0), max(0, y0)
-    x1, y1 = min(page_w, x1), min(page_h, y1)
-
-    clip = fitz.Rect(x0, y0, x1, y1)
-
     doc = fitz.open(pdf_path)
     page = doc[page_idx]
+    rect = page.rect
+
+    clip, _, _, _, _ = _calc_cell_clip(rect.width, rect.height, cell_idx, rows, cols, overlap)
     text_dict = page.get_text("dict", clip=clip)
     doc.close()
 
     # type=0: 텍스트 블록, type=1: 이미지 블록 (bytes 포함으로 JSON 직렬화 불가)
     text_blocks = [b for b in text_dict.get("blocks", []) if b.get("type") == 0]
 
+    if format == "text":
+        lines_text = []
+        for block in text_blocks:
+            for line in block.get("lines", []):
+                line_text = "".join(span.get("text", "") for span in line.get("spans", []))
+                if line_text.strip():
+                    lines_text.append(line_text)
+        return {
+            "text": "\n".join(lines_text),
+            "cell_idx": cell_idx,
+            "clip_rect": [clip.x0, clip.y0, clip.x1, clip.y1],
+        }
+
+    # format == "compact": bbox + text만 유지
+    compact_blocks = []
+    for block in text_blocks:
+        compact_lines = []
+        for line in block.get("lines", []):
+            compact_spans = [
+                {"text": s.get("text", ""), "bbox": s["bbox"]}
+                for s in line.get("spans", [])
+            ]
+            compact_lines.append({"bbox": line["bbox"], "spans": compact_spans})
+        compact_blocks.append({"bbox": block["bbox"], "lines": compact_lines})
+
     return {
-        "blocks": text_blocks,
+        "blocks": compact_blocks,
         "cell_idx": cell_idx,
-        "clip_rect": [x0, y0, x1, y1],
+        "clip_rect": [clip.x0, clip.y0, clip.x1, clip.y1],
     }
