@@ -80,6 +80,7 @@ def get_tile(
     grid_cols: int = 8,
     dpi: int = 72,
     page_idx: int = 0,
+    overlap: float = 0.0,
 ) -> Image:
     """
     대용량 PDF 분석의 두 번째 단계입니다.
@@ -97,8 +98,10 @@ def get_tile(
         dpi: 렌더링 해상도 (기본 72 DPI — 이 문서는 원본 자체가 초고해상도이므로
              72 DPI도 충분히 선명합니다. 더 높은 해상도가 필요하면 높이세요.)
         page_idx: 페이지 번호 (0부터 시작, 기본 0)
+        overlap: 타일 경계 확장 비율 (기본 0.0 — 0.1이면 상하좌우 각 10% 확장,
+                 경계에 걸친 텍스트·도형을 양쪽 타일에서 볼 수 있습니다. 권장 범위: 0.0~0.5 미만)
     """
-    tile_bytes = render_tile(pdf_path, cell_idx, grid_rows, grid_cols, dpi=dpi, page_idx=page_idx)
+    tile_bytes = render_tile(pdf_path, cell_idx, grid_rows, grid_cols, dpi=dpi, page_idx=page_idx, overlap=overlap)
     return Image(data=tile_bytes, format="jpeg")
 
 
@@ -109,6 +112,7 @@ def get_tile_as_pdf(
     grid_rows: int = 8,
     grid_cols: int = 8,
     page_idx: int = 0,
+    overlap: float = 0.0,
 ) -> str:
     """
     대용량 PDF 분석의 두 번째 단계 (PDF 출력 버전)입니다.
@@ -129,8 +133,10 @@ def get_tile_as_pdf(
         grid_rows: 그리드 행 수 (get_overview와 동일하게)
         grid_cols: 그리드 열 수 (get_overview와 동일하게)
         page_idx: 페이지 번호 (0부터 시작, 기본 0)
+        overlap: 타일 경계 확장 비율 (기본 0.0 — 0.1이면 상하좌우 각 10% 확장,
+                 경계에 걸친 텍스트·도형을 양쪽 타일에서 볼 수 있습니다. 권장 범위: 0.0~0.5 미만)
     """
-    pdf_bytes = render_tile_as_pdf(pdf_path, cell_idx, grid_rows, grid_cols, page_idx=page_idx)
+    pdf_bytes = render_tile_as_pdf(pdf_path, cell_idx, grid_rows, grid_cols, page_idx=page_idx, overlap=overlap)
     tmp = tempfile.NamedTemporaryFile(
         delete=False,
         suffix=f"_cell{cell_idx}.pdf",

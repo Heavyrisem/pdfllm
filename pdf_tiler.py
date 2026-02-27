@@ -38,6 +38,7 @@ def render_tile(
     cols: int,
     dpi: int = 300,
     page_idx: int = 0,
+    overlap: float = 0.0,
 ) -> bytes:
     """
     그리드 셀 인덱스에 해당하는 영역을 고해상도로 렌더링하여 JPEG bytes 반환.
@@ -50,11 +51,20 @@ def render_tile(
     row, col = divmod(cell_idx, cols)
     tile_w = rect.width / cols
     tile_h = rect.height / rows
+
+    x0 = col * tile_w
+    y0 = row * tile_h
+    x1 = (col + 1) * tile_w
+    y1 = (row + 1) * tile_h
+
+    pad_x = overlap * tile_w
+    pad_y = overlap * tile_h
+
     clip = fitz.Rect(
-        col * tile_w,
-        row * tile_h,
-        (col + 1) * tile_w,
-        (row + 1) * tile_h,
+        max(rect.x0, x0 - pad_x),
+        max(rect.y0, y0 - pad_y),
+        min(rect.x1, x1 + pad_x),
+        min(rect.y1, y1 + pad_y),
     )
 
     mat = fitz.Matrix(dpi / 72, dpi / 72)
@@ -74,6 +84,7 @@ def render_tile_as_pdf(
     rows: int,
     cols: int,
     page_idx: int = 0,
+    overlap: float = 0.0,
 ) -> bytes:
     """
     그리드 셀 영역을 Ghostscript로 최적화하여 PDF bytes 반환.
@@ -93,11 +104,20 @@ def render_tile_as_pdf(
     row, col = divmod(cell_idx, cols)
     tile_w = rect.width / cols
     tile_h = rect.height / rows
+
+    x0 = col * tile_w
+    y0 = row * tile_h
+    x1 = (col + 1) * tile_w
+    y1 = (row + 1) * tile_h
+
+    pad_x = overlap * tile_w
+    pad_y = overlap * tile_h
+
     clip = fitz.Rect(
-        col * tile_w,
-        row * tile_h,
-        (col + 1) * tile_w,
-        (row + 1) * tile_h,
+        max(rect.x0, x0 - pad_x),
+        max(rect.y0, y0 - pad_y),
+        min(rect.x1, x1 + pad_x),
+        min(rect.y1, y1 + pad_y),
     )
 
     with tempfile.TemporaryDirectory() as tmp:
