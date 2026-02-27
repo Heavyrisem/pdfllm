@@ -1,0 +1,4 @@
+# get_tile_as_pdf 사용 시 Ghostscript 필요: brew install ghostscript
+pymupdf>=1.24.0
+mcp>=1.0.0
+Pillow>=10.0.0
