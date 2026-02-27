@@ -4,7 +4,7 @@ import os
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from pdf_tiler import render_overview, render_tile, render_tile_as_pdf, get_page_count as _get_page_count
+from pdf_tiler import render_overview, render_tile, render_tile_as_pdf, get_page_count as _get_page_count, extract_tile_text
 from scaffold import add_grid_overlay
 
 mcp = FastMCP(
@@ -145,6 +145,41 @@ def get_tile_as_pdf(
     tmp.write(pdf_bytes)
     tmp.close()
     return tmp.name
+
+
+@mcp.tool()
+def get_tile_text(
+    pdf_path: str,
+    cell_idx: int,
+    grid_rows: int = 8,
+    grid_cols: int = 8,
+    page_idx: int = 0,
+    overlap: float = 0.0,
+) -> str:
+    """
+    특정 셀 영역의 벡터 텍스트 데이터를 JSON 형식으로 반환합니다.
+
+    get_tile(이미지)과 함께 사용하면 LLM이 이미지와 텍스트를 교차 검증하여
+    텍스트 인식 정확도를 높일 수 있습니다.
+    동일한 cell_idx와 grid 설정을 사용하면 get_tile과 좌표가 일치합니다.
+
+    반환값 구조:
+    - blocks: fitz 텍스트 블록 리스트 (span별 좌표·폰트·텍스트 포함)
+    - cell_idx: 요청한 셀 번호
+    - clip_rect: 추출 영역 [x0, y0, x1, y1] (포인트 단위)
+
+    주의: grid_rows, grid_cols는 get_overview 호출 시 사용한 값과 반드시 동일해야 합니다.
+
+    Args:
+        pdf_path: PDF 파일 절대 경로
+        cell_idx: 추출할 셀 번호 (get_overview 이미지에 표시된 번호)
+        grid_rows: 그리드 행 수 (get_overview와 동일하게)
+        grid_cols: 그리드 열 수 (get_overview와 동일하게)
+        page_idx: 페이지 번호 (0부터 시작, 기본 0)
+        overlap: 타일 경계 확장 비율 (기본 0.0 — get_tile과 동일한 값을 사용하세요)
+    """
+    result = extract_tile_text(pdf_path, cell_idx, grid_rows, grid_cols, page_idx=page_idx, overlap=overlap)
+    return json.dumps(result, ensure_ascii=False)
 
 
 if __name__ == "__main__":

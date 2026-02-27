@@ -158,3 +158,46 @@ def get_page_size(pdf_path: str, page_idx: int = 0) -> tuple[float, float]:
     rect = doc[page_idx].rect
     doc.close()
     return rect.width, rect.height
+
+
+def extract_tile_text(
+    pdf_path: str,
+    cell_idx: int,
+    rows: int,
+    cols: int,
+    page_idx: int = 0,
+    overlap: float = 0.0,
+) -> dict:
+    """
+    그리드 셀 인덱스에 해당하는 영역의 텍스트를 추출하여 반환.
+    render_tile과 동일한 clip 계산 로직을 사용하므로 좌표가 일치합니다.
+    """
+    page_w, page_h = get_page_size(pdf_path, page_idx)
+
+    row, col = divmod(cell_idx, cols)
+    tile_w = page_w / cols
+    tile_h = page_h / rows
+
+    x0 = col * tile_w - overlap * tile_w
+    y0 = row * tile_h - overlap * tile_h
+    x1 = x0 + tile_w + 2 * overlap * tile_w
+    y1 = y0 + tile_h + 2 * overlap * tile_h
+
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(page_w, x1), min(page_h, y1)
+
+    clip = fitz.Rect(x0, y0, x1, y1)
+
+    doc = fitz.open(pdf_path)
+    page = doc[page_idx]
+    text_dict = page.get_text("dict", clip=clip)
+    doc.close()
+
+    # type=0: 텍스트 블록, type=1: 이미지 블록 (bytes 포함으로 JSON 직렬화 불가)
+    text_blocks = [b for b in text_dict.get("blocks", []) if b.get("type") == 0]
+
+    return {
+        "blocks": text_blocks,
+        "cell_idx": cell_idx,
+        "clip_rect": [x0, y0, x1, y1],
+    }
