@@ -82,6 +82,10 @@ class MonitorState:
         self.active_calls: dict[str, CallRecord] = {}
         self.tool_stats: dict[str, dict] = {}
         self._image_call_ids: deque[str] = deque(maxlen=MAX_IMAGE_CALLS)
+        self.instance_id = f"pid_{os.getpid()}"
+        self.remote_instances: dict[str, dict] = {}   # instance_id → snapshot
+        self.remote_images: dict[str, bytes] = {}     # call_id → jpeg bytes
+        self._remote_lock = threading.Lock()
 
     def begin_call(self, tool_name: str, kwargs: dict) -> str:
         call_id = uuid.uuid4().hex[:8]
@@ -168,12 +172,36 @@ class MonitorState:
                 "tools": list(self.tool_stats.keys()),
             }
 
+    def update_remote(self, instance_id: str, snapshot: dict) -> None:
+        """Reporter에서 받은 상태 스냅샷 저장."""
+        with self._remote_lock:
+            snapshot["last_seen"] = time.time()
+            self.remote_instances[instance_id] = snapshot
+            for call in snapshot.get("recent_calls", []):
+                if call.get("image_b64"):
+                    self.remote_images[call["id"]] = base64.b64decode(call.pop("image_b64"))
+
+    def get_all_status(self) -> dict:
+        """로컬 + 원격 인스턴스 통합 상태 반환."""
+        local = self.get_status()
+        local["instance_id"] = self.instance_id
+        with self._remote_lock:
+            alive = {
+                iid: s for iid, s in self.remote_instances.items()
+                if time.time() - s.get("last_seen", 0) < 5
+            }
+        return {
+            "self_instance_id": self.instance_id,
+            "instances": {self.instance_id: local, **alive},
+        }
+
     def get_image(self, call_id: str) -> Optional[bytes]:
         with self._lock:
             for c in self.calls:
                 if c.id == call_id:
                     return c.image_bytes
-        return None
+        with self._remote_lock:
+            return self.remote_images.get(call_id)
 
 
 monitor_state = MonitorState()
@@ -229,7 +257,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; }
   .uptime { color: #8b949e; font-size: 12px; }
-  .layout { display: flex; height: calc(100vh - 45px); overflow: hidden; }
   /* 좌측: 도구 통계 */
   .sidebar {
     width: 220px; min-width: 200px; background: #161b22;
@@ -290,6 +317,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+  /* 인스턴스 탭 */
+  #instance-tabs {
+    display: flex; align-items: center; gap: 4px;
+    background: #161b22; border-bottom: 1px solid #30363d;
+    padding: 0 14px; overflow-x: auto; flex-shrink: 0;
+  }
+  .tab {
+    padding: 7px 14px; font-size: 12px; color: #8b949e; cursor: pointer;
+    border-bottom: 2px solid transparent; white-space: nowrap;
+    transition: color .15s, border-color .15s;
+  }
+  .tab:hover { color: #c9d1d9; }
+  .tab.active { color: #58a6ff; border-bottom-color: #58a6ff; font-weight: 600; }
+  .tab.offline { color: #484f58; }
+  .layout { display: flex; overflow: hidden; }
 </style>
 </head>
 <body>
@@ -297,7 +339,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <h1>pdfllm MCP Monitor</h1>
   <span class="status-badge"><span class="dot"></span>Running <span class="uptime" id="uptime"></span></span>
 </header>
-<div class="layout">
+<div id="instance-tabs"></div>
+<div class="layout" style="height: calc(100vh - 80px);">
   <aside class="sidebar">
     <h2>도구 통계</h2>
     <div id="tool-stats"></div>
@@ -320,6 +363,8 @@ const ALL_TOOLS = [
 ];
 const IMAGE_TOOLS = new Set(["get_overview","get_tile"]);
 let cachedImages = {};  // call_id -> data URL
+let selectedInstance = null;
+let selfInstanceId = null;
 
 function fmtUptime(s) {
   const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
@@ -419,10 +464,40 @@ async function render(data) {
   document.getElementById('recent-calls').innerHTML = cards;
 }
 
+function renderTabs(data) {
+  const instances = data.instances || {};
+  const now = Date.now() / 1000;
+  const html = Object.entries(instances).map(([iid, s]) => {
+    const isMaster = iid === data.self_instance_id;
+    const lastSeen = s.last_seen || now;
+    const offline = !isMaster && (now - lastSeen >= 5);
+    const label = isMaster ? `${iid} (master)` : iid;
+    const classes = ['tab', selectedInstance === iid ? 'active' : '', offline ? 'offline' : ''].filter(Boolean).join(' ');
+    return `<div class="${classes}" onclick="selectInstance('${iid}')">${escHtml(label)}</div>`;
+  }).join('');
+  document.getElementById('instance-tabs').innerHTML = html;
+}
+
+function selectInstance(iid) {
+  selectedInstance = iid;
+  document.querySelectorAll('.tab').forEach(el => {
+    el.classList.toggle('active', el.textContent.startsWith(iid));
+  });
+}
+
 async function poll() {
   try {
     const r = await fetch('/api/status');
-    if(r.ok) await render(await r.json());
+    if(r.ok) {
+      const data = await r.json();
+      selfInstanceId = data.self_instance_id;
+      if(!selectedInstance || !data.instances[selectedInstance]) {
+        selectedInstance = selfInstanceId;
+      }
+      renderTabs(data);
+      const instanceData = data.instances[selectedInstance];
+      if(instanceData) await render(instanceData);
+    }
   } catch {}
   setTimeout(poll, 1000);
 }
@@ -448,6 +523,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):  # noqa: N802
+        if self.path == "/api/report":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            monitor_state.update_remote(body["instance_id"], body["state"])
+            self._send(200, "application/json", b'{"ok":true}')
+        else:
+            self._send(404, "text/plain", b"not found")
+
     def do_GET(self):  # noqa: N802
         path = self.path.split("?")[0]
 
@@ -456,7 +540,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", body)
 
         elif path == "/api/status":
-            data = monitor_state.get_status()
+            data = monitor_state.get_all_status()
             body = json.dumps(data, ensure_ascii=False).encode()
             self._send(200, "application/json", body)
 
@@ -479,9 +563,39 @@ class MonitorServer:
     def start(self) -> None:
         try:
             httpd = HTTPServer(("", self.port), _Handler)
-        except OSError as e:
-            print(f"[monitor] 포트 {self.port} 바인드 실패: {e}", flush=True)
+        except OSError:
+            self._start_reporter()
             return
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
         print(f"[monitor] 대시보드: http://localhost:{self.port}", flush=True)
+
+    def _start_reporter(self) -> None:
+        master_url = f"http://localhost:{self.port}/api/report"
+        instance_id = monitor_state.instance_id
+        print(f"[monitor] Reporter 모드 → {master_url}", flush=True)
+
+        def _loop():
+            import urllib.request
+            while True:
+                try:
+                    state = monitor_state.get_status()
+                    for call in state["recent_calls"]:
+                        if call.get("has_image"):
+                            img = monitor_state.get_image(call["id"])
+                            if img:
+                                call["image_b64"] = base64.b64encode(img).decode()
+                    payload = json.dumps(
+                        {"instance_id": instance_id, "state": state},
+                        ensure_ascii=False,
+                    ).encode()
+                    req = urllib.request.Request(
+                        master_url, data=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    urllib.request.urlopen(req, timeout=1)
+                except Exception:
+                    pass
+                time.sleep(1)
+
+        threading.Thread(target=_loop, daemon=True).start()

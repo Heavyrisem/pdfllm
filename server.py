@@ -335,6 +335,10 @@ def find_cells(
     return json.dumps(result, ensure_ascii=False)
 
 
-if __name__ == "__main__":
+def main():
     MonitorServer().start()
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
