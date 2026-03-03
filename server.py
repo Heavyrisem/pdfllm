@@ -86,6 +86,8 @@ def suggest_grid(
     - text_density: 텍스트 밀도 (문자 수 / 페이지 면적)
     - suggested_grid: 추천 그리드 크기 {"rows": ..., "cols": ...}
     - suggested_tile_size_pt: 추천 그리드 사용 시 타일 크기 (포인트 단위)
+    - suggested_dpi: get_tile 호출 시 권장 DPI
+    - suggested_dpi_note: DPI 산출 근거 {min_dpi, max_dpi, min_font_size_pt, content_type}
 
     Args:
         pdf_path: PDF 파일 절대 경로

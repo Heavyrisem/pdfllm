@@ -97,12 +97,15 @@ def analyze_page(
     text_blocks = [b for b in blocks if b.get("type") == 0]
     image_blocks = [b for b in blocks if b.get("type") == 1]
 
-    total_chars = sum(
-        len(span.get("text", ""))
-        for block in text_blocks
-        for line in block.get("lines", [])
-        for span in line.get("spans", [])
-    )
+    font_sizes: list[float] = []
+    total_chars = 0
+    for block in text_blocks:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                total_chars += len(span.get("text", ""))
+                size = span.get("size", 0)
+                if size > 0:
+                    font_sizes.append(size)
 
     doc.close()
 
@@ -119,6 +122,56 @@ def analyze_page(
     suggested_rows = _round_grid(base_rows)
     suggested_cols = _round_grid(base_cols)
 
+    # DPI 계산 상수
+    _TARGET_FONT_PX = 12   # 가독성 기준 최소 픽셀 높이
+    _MAX_TILE_PX = 2000    # 타일 긴 쪽 최대 픽셀
+    _BASE_DPI = 72
+    _DPI_CANDIDATES = [72, 96, 120, 144, 150, 200, 300]
+
+    tile_w_pt = page_w / suggested_cols
+    tile_h_pt = page_h / suggested_rows
+    tile_long_pt = max(tile_w_pt, tile_h_pt)
+
+    img_original_dpi = None
+
+    if font_sizes:
+        min_font_pt = min(font_sizes)
+        min_dpi = ceil((_TARGET_FONT_PX / min_font_pt) * _BASE_DPI)
+        min_dpi = max(min_dpi, _BASE_DPI)
+        content_type = "text"
+    elif image_blocks:
+        img_dpis = []
+        for block in image_blocks:
+            img_px_w = block.get("width", 0)
+            bbox = block.get("bbox", [0, 0, 0, 0])
+            bbox_w_pt = bbox[2] - bbox[0]
+            if img_px_w > 0 and bbox_w_pt > 0:
+                img_dpis.append(img_px_w / bbox_w_pt * 72)
+        if img_dpis:
+            img_original_dpi = round(max(img_dpis))
+            min_dpi = _BASE_DPI          # 스캔도 최솟값은 BASE_DPI로 유지
+            content_type = "scanned"
+        else:
+            min_dpi = _BASE_DPI
+            content_type = "image_only"
+    else:
+        min_dpi = _BASE_DPI
+        content_type = "image_only"
+
+    # 타일 크기 기반 max_dpi
+    max_dpi = int((_MAX_TILE_PX / tile_long_pt) * _BASE_DPI)
+    # 스캔 PDF: 원본 DPI 이상 렌더링해도 품질 향상 없음 → 추가 상한 적용
+    if img_original_dpi is not None:
+        max_dpi = min(max_dpi, img_original_dpi)
+    max_dpi = max(max_dpi, min_dpi)
+
+    # DPI 후보 중 max_dpi 이하 최댓값 선택
+    suggested_dpi = max(
+        (d for d in _DPI_CANDIDATES if d <= max_dpi),
+        default=min_dpi,
+    )
+    suggested_dpi = max(suggested_dpi, min_dpi)
+
     PT_TO_MM = 0.3528
     return {
         "page_size_pt": {"width": page_w, "height": page_h},
@@ -131,6 +184,14 @@ def analyze_page(
         "suggested_tile_size_pt": {
             "width": round(page_w / suggested_cols, 1),
             "height": round(page_h / suggested_rows, 1),
+        },
+        "suggested_dpi": suggested_dpi,
+        "suggested_dpi_note": {
+            "min_dpi": min_dpi,
+            "max_dpi": max_dpi,
+            "min_font_size_pt": round(min(font_sizes), 1) if font_sizes else None,
+            "img_original_dpi": img_original_dpi if content_type == "scanned" else None,
+            "content_type": content_type,
         },
     }
 
