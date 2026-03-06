@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pdfllm MCP Monitor</title>
+<link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+<header>
+  <h1>pdfllm MCP Monitor</h1>
+  <span class="status-badge"><span class="dot"></span>Running <span class="uptime" id="uptime"></span></span>
+</header>
+<div id="instance-tabs"></div>
+<div class="layout" style="height: calc(100vh - 80px);">
+  <aside class="sidebar">
+    <h2>도구 통계</h2>
+    <div id="tool-stats"></div>
+  </aside>
+  <main class="main">
+    <div class="active-section">
+      <h2>현재 실행 중</h2>
+      <div id="active-calls"><span class="empty">실행 중인 도구 없음</span></div>
+    </div>
+    <div class="log-section">
+      <h2>최근 호출</h2>
+      <div id="recent-calls"></div>
+    </div>
+  </main>
+</div>
+<script src="/dashboard.js"></script>
+</body>
+</html>

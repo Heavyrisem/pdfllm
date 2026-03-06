@@ -1,11 +1,22 @@
-import shutil
-import subprocess
-import tempfile
-from math import ceil
-from pathlib import Path
+import statistics
 
 import fitz  # PyMuPDF
 import pdfplumber
+
+# ---------------------------------------------------------------------------
+# 상수
+# ---------------------------------------------------------------------------
+
+_MAX_RECURSION_DEPTH = 3
+_OUTLIER_AREA_MULTIPLIER = 4.0
+_BBOX_ROUND_PRECISION = 1
+_BG_THRESHOLD = 0.7      # _collect_drawing_rects: 배경 프레임 판단 비율
+_LOCAL_BG_RATIO = 0.8    # band 높이 대비 로컬 배경 판단 비율
+
+
+# ---------------------------------------------------------------------------
+# 내부 유틸리티
+# ---------------------------------------------------------------------------
 
 
 def _extract_text_clip(pdf_path: str, clip: fitz.Rect, page_idx: int) -> str:
@@ -30,170 +41,20 @@ def _extract_text_clip(pdf_path: str, clip: fitz.Rect, page_idx: int) -> str:
         return ""
 
 
-def _round_grid(n: int) -> int:
-    """후보 목록 중 n 이상인 최솟값 반환."""
-    candidates = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64]
-    for c in candidates:
-        if c >= n:
-            return c
-    return candidates[-1]
-
-
-def _calc_cell_clip(
+def _apply_padding(
+    bbox: tuple,
+    padding_pt: float,
     page_w: float,
     page_h: float,
-    cell_idx: int,
-    rows: int,
-    cols: int,
-    overlap: float = 0.0,
-) -> tuple[fitz.Rect, float, float, int, int]:
-    """
-    셀 인덱스로부터 클립 영역(fitz.Rect)과 메타데이터를 계산한다.
-
-    Returns:
-        (clip, tile_w, tile_h, row, col)
-    """
-    row, col = divmod(cell_idx, cols)
-    tile_w = page_w / cols
-    tile_h = page_h / rows
-
-    pad_x = overlap * tile_w
-    pad_y = overlap * tile_h
-
-    x0 = max(0.0, col * tile_w - pad_x)
-    y0 = max(0.0, row * tile_h - pad_y)
-    x1 = min(page_w, (col + 1) * tile_w + pad_x)
-    y1 = min(page_h, (row + 1) * tile_h + pad_y)
-
-    return fitz.Rect(x0, y0, x1, y1), tile_w, tile_h, row, col
-
-
-def analyze_page(
-    pdf_path: str,
-    page_idx: int = 0,
-    target_tile_pt: int = 1500,
-) -> dict:
-    """
-    페이지 크기·텍스트 밀도를 분석하고 적절한 그리드 크기를 추천한다.
-
-    Args:
-        pdf_path: PDF 파일 절대 경로
-        page_idx: 분석할 페이지 번호 (0부터 시작)
-        target_tile_pt: 목표 타일 크기 (포인트 단위, 기본 1500)
-
-    Returns:
-        page_size_pt, page_size_mm, text_block_count, total_chars,
-        image_block_count, text_density, suggested_grid, suggested_tile_size_pt
-    """
-    doc = fitz.open(pdf_path)
-    page = doc[page_idx]
-    rect = page.rect
-    page_w = rect.width
-    page_h = rect.height
-
-    text_dict = page.get_text("dict")
-    blocks = text_dict.get("blocks", [])
-
-    text_blocks = [b for b in blocks if b.get("type") == 0]
-    image_blocks = [b for b in blocks if b.get("type") == 1]
-
-    font_sizes: list[float] = []
-    total_chars = 0
-    for block in text_blocks:
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                total_chars += len(span.get("text", ""))
-                size = span.get("size", 0)
-                if size > 0:
-                    font_sizes.append(size)
-
-    doc.close()
-
-    area = page_w * page_h
-    density = total_chars / area if area > 0 else 0.0
-
-    base_cols = ceil(page_w / target_tile_pt)
-    base_rows = ceil(page_h / target_tile_pt)
-
-    if density > 0.01:
-        base_cols = ceil(base_cols * 1.5)
-        base_rows = ceil(base_rows * 1.5)
-
-    suggested_rows = _round_grid(base_rows)
-    suggested_cols = _round_grid(base_cols)
-
-    # DPI 계산 상수
-    _TARGET_FONT_PX = 12   # 가독성 기준 최소 픽셀 높이
-    _MAX_TILE_PX = 2000    # 타일 긴 쪽 최대 픽셀
-    _BASE_DPI = 72
-    _DPI_CANDIDATES = [72, 96, 120, 144, 150, 200, 300]
-
-    tile_w_pt = page_w / suggested_cols
-    tile_h_pt = page_h / suggested_rows
-    tile_long_pt = max(tile_w_pt, tile_h_pt)
-
-    img_original_dpi = None
-
-    if font_sizes:
-        min_font_pt = min(font_sizes)
-        min_dpi = ceil((_TARGET_FONT_PX / min_font_pt) * _BASE_DPI)
-        min_dpi = max(min_dpi, _BASE_DPI)
-        content_type = "text"
-    elif image_blocks:
-        img_dpis = []
-        for block in image_blocks:
-            img_px_w = block.get("width", 0)
-            bbox = block.get("bbox", [0, 0, 0, 0])
-            bbox_w_pt = bbox[2] - bbox[0]
-            if img_px_w > 0 and bbox_w_pt > 0:
-                img_dpis.append(img_px_w / bbox_w_pt * 72)
-        if img_dpis:
-            img_original_dpi = round(max(img_dpis))
-            min_dpi = _BASE_DPI          # 스캔도 최솟값은 BASE_DPI로 유지
-            content_type = "scanned"
-        else:
-            min_dpi = _BASE_DPI
-            content_type = "image_only"
-    else:
-        min_dpi = _BASE_DPI
-        content_type = "image_only"
-
-    # 타일 크기 기반 max_dpi
-    max_dpi = int((_MAX_TILE_PX / tile_long_pt) * _BASE_DPI)
-    # 스캔 PDF: 원본 DPI 이상 렌더링해도 품질 향상 없음 → 추가 상한 적용
-    if img_original_dpi is not None:
-        max_dpi = min(max_dpi, img_original_dpi)
-    max_dpi = max(max_dpi, min_dpi)
-
-    # DPI 후보 중 max_dpi 이하 최댓값 선택
-    suggested_dpi = max(
-        (d for d in _DPI_CANDIDATES if d <= max_dpi),
-        default=min_dpi,
+) -> tuple:
+    """bbox에 padding을 적용하고 페이지 경계로 클램핑한다."""
+    x0, y0, x1, y1 = bbox
+    return (
+        max(0.0, x0 - padding_pt),
+        max(0.0, y0 - padding_pt),
+        min(page_w, x1 + padding_pt),
+        min(page_h, y1 + padding_pt),
     )
-    suggested_dpi = max(suggested_dpi, min_dpi)
-
-    PT_TO_MM = 0.3528
-    return {
-        "page_size_pt": {"width": page_w, "height": page_h},
-        "page_size_mm": {"width": round(page_w * PT_TO_MM, 1), "height": round(page_h * PT_TO_MM, 1)},
-        "text_block_count": len(text_blocks),
-        "total_chars": total_chars,
-        "image_block_count": len(image_blocks),
-        "text_density": density,
-        "suggested_grid": {"rows": suggested_rows, "cols": suggested_cols},
-        "suggested_tile_size_pt": {
-            "width": round(page_w / suggested_cols, 1),
-            "height": round(page_h / suggested_rows, 1),
-        },
-        "suggested_dpi": suggested_dpi,
-        "suggested_dpi_note": {
-            "min_dpi": min_dpi,
-            "max_dpi": max_dpi,
-            "min_font_size_pt": round(min(font_sizes), 1) if font_sizes else None,
-            "img_original_dpi": img_original_dpi if content_type == "scanned" else None,
-            "content_type": content_type,
-        },
-    }
 
 
 def get_page_count(pdf_path: str) -> dict:
@@ -207,41 +68,346 @@ def get_page_count(pdf_path: str) -> dict:
     return {"page_count": len(pages), "pages": pages}
 
 
-def render_overview(pdf_path: str, max_px: int = 2048, page_idx: int = 0) -> bytes:
-    """전체 페이지를 max_px 이내로 축소 렌더링하여 JPEG bytes 반환."""
+# ── detect_layout / get_region 관련 함수 ──────────────────────────────────────
+
+def _collect_text_rects(page: fitz.Page) -> list[tuple[float, float, float, float]]:
+    """텍스트 블록 bbox 수집 (cut line 계산 전용)."""
+    rects = []
+    for block in page.get_text("blocks"):
+        x0, y0, x1, y1 = block[0], block[1], block[2], block[3]
+        if (x1 - x0) > 2 and (y1 - y0) > 2:
+            rects.append((x0, y0, x1, y1))
+    return rects
+
+
+def _collect_drawing_rects(
+    page: fitz.Page,
+    bg_threshold: float = _BG_THRESHOLD,
+) -> list[tuple[float, float, float, float]]:
+    """
+    드로잉 bbox 수집.
+    페이지 전체를 덮는 배경 프레임(bg_threshold 이상)은 제외한다.
+    """
+    page_w = page.rect.width
+    page_h = page.rect.height
+    max_draw_w = page_w * bg_threshold
+    max_draw_h = page_h * bg_threshold
+
+    rects = []
+    for d in page.get_drawings():
+        r = d.get("rect")
+        if r is None:
+            continue
+        x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
+        w, h = x1 - x0, y1 - y0
+        if w < 5 or h < 5:
+            continue
+        if w >= max_draw_w and h >= max_draw_h:
+            continue
+        rects.append((x0, y0, x1, y1))
+    return rects
+
+
+def _find_axis_cuts(
+    rects: list[tuple],
+    axis: int,
+    axis_max: float,
+    min_gap: float,
+    axis_min: float = 0.0,
+) -> list[float]:
+    """
+    1D sweep으로 whitespace gap의 중점을 cut line으로 반환한다.
+
+    axis=0: X축 기준 (수직 절단선)
+    axis=1: Y축 기준 (수평 절단선)
+    axis_min/axis_max: 분석 범위 (서브 영역 재귀 분석 시 사용)
+    """
+    if not rects:
+        return []
+
+    events: list[tuple[float, str]] = []
+    for r in rects:
+        # 좌표를 axis 범위로 클램핑 (서브 영역 경계에 걸친 rect 처리)
+        lo = max(r[axis], axis_min)
+        hi = min(r[axis + 2], axis_max)
+        if lo >= hi:
+            continue
+        events.append((lo, "open"))
+        events.append((hi, "close"))
+
+    if not events:
+        return []
+
+    events.sort(key=lambda e: (e[0], 0 if e[1] == "open" else 1))
+
+    cuts = []
+    depth = 0
+    gap_start = axis_min
+
+    for coord, kind in events:
+        if kind == "open":
+            if depth == 0:
+                gap_end = coord
+                if gap_start < gap_end and (gap_end - gap_start) >= min_gap:
+                    cuts.append((gap_start + gap_end) / 2)
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                gap_start = coord
+
+    if depth == 0 and gap_start < axis_max and (axis_max - gap_start) >= min_gap:
+        cuts.append((gap_start + axis_max) / 2)
+
+    return cuts
+
+
+def _detect_regions_in_area(
+    text_rects: list[tuple],
+    draw_rects: list[tuple],
+    all_rects: list[tuple],
+    area_x0: float,
+    area_y0: float,
+    area_x1: float,
+    area_y1: float,
+    min_gap_pt: float,
+    padding_pt: float,
+    page_w: float,
+    page_h: float,
+) -> list[tuple]:
+    """
+    주어진 area 내에서 region bbox 목록을 반환한다.
+
+    cut line 전략:
+    - Y-cuts: 텍스트 + 높이 >= thin_pt 인 드로잉만 사용
+              → 얇은 connector/border rect(bridge)가 Y 방향 gap을 막는 문제 방지
+    - X-cuts: 텍스트 + (band 높이 80% 미만) + (너비 >= thin_pt) 드로잉
+              → 방안 A(로컬 배경) + thin-rect 이중 필터
+    - tight bbox: all_rects(텍스트+드로잉 전체) 기준
+
+    thin_pt = min_gap_pt * 3 (기본 30pt × 3 = 90pt)
+    """
+    thin_pt = min_gap_pt * 3
+
+    def _in_area(r: tuple) -> bool:
+        return r[0] < area_x1 and r[2] > area_x0 and r[1] < area_y1 and r[3] > area_y0
+
+    def _x_overlap(r: tuple) -> bool:
+        """X 범위만 검사 (Y-cut 계산에서 현재 X 범위 내 rects만 사용)."""
+        return r[0] < area_x1 and r[2] > area_x0
+
+    area_text = [r for r in text_rects if _in_area(r)]
+    area_draw = [r for r in draw_rects if _in_area(r)]
+    area_all  = [r for r in all_rects  if _in_area(r)]
+
+    if not area_text and not area_draw:
+        return []
+
+    # Y-cuts용 rects: 텍스트 전체 + 충분히 높은 드로잉
+    # 단, 현재 X 범위에 걸치는 rects만 사용
+    # → 다른 X 컬럼의 tall rect가 이 영역의 Y-gap을 막는 문제 방지
+    text_x = [r for r in text_rects if _x_overlap(r) and r[1] < area_y1 and r[3] > area_y0]
+    draw_x = [r for r in draw_rects if _x_overlap(r) and r[1] < area_y1 and r[3] > area_y0]
+    draw_tall = [r for r in draw_x if (r[3] - r[1]) >= thin_pt]
+
+    cut_y = text_x + draw_tall
+    if not cut_y:
+        cut_y = text_x + draw_x  # fallback: 얇은 것밖에 없으면 전부 사용
+    if not cut_y:
+        return []
+
+    # ① Y축 수평 절단선
+    h_cuts = _find_axis_cuts(cut_y, axis=1, axis_max=area_y1, min_gap=min_gap_pt, axis_min=area_y0)
+    y_boundaries = [area_y0] + h_cuts + [area_y1]
+    bands = [(y_boundaries[i], y_boundaries[i + 1]) for i in range(len(y_boundaries) - 1)]
+
+    result: list[tuple] = []
+
+    for band_y0, band_y1 in bands:
+        band_text = [r for r in area_text if r[1] < band_y1 and r[3] > band_y0]
+        band_draw = [r for r in area_draw if r[1] < band_y1 and r[3] > band_y0]
+
+        if not band_text and not band_draw:
+            continue
+
+        # ② X축 수직 절단선
+        # 방안 A: band 높이의 _LOCAL_BG_RATIO 이상 rect → 로컬 배경 제거
+        band_h = band_y1 - band_y0
+        local_bg_h = band_h * _LOCAL_BG_RATIO
+        # thin-rect 필터: 너비 >= thin_pt인 드로잉만 X-cut에 사용
+        band_draw_x = [r for r in band_draw if (r[3] - r[1]) < local_bg_h and (r[2] - r[0]) >= thin_pt]
+
+        cut_x = band_text + band_draw_x
+        if not cut_x:
+            # fallback: 필터 후 비어있으면 로컬 배경 필터만 적용
+            cut_x = band_text + [r for r in band_draw if (r[3] - r[1]) < local_bg_h]
+        if not cut_x:
+            cut_x = band_text + band_draw
+
+        v_cuts = _find_axis_cuts(cut_x, axis=0, axis_max=area_x1, min_gap=min_gap_pt, axis_min=area_x0)
+        x_boundaries = [area_x0] + v_cuts + [area_x1]
+        col_ranges = [(x_boundaries[i], x_boundaries[i + 1]) for i in range(len(x_boundaries) - 1)]
+
+        for col_x0, col_x1 in col_ranges:
+            col_cut = [r for r in band_text + band_draw if r[0] < col_x1 and r[2] > col_x0]
+            if not col_cut:
+                continue
+
+            col_all = [
+                r for r in area_all
+                if r[0] < col_x1 and r[2] > col_x0 and r[1] < band_y1 and r[3] > band_y0
+            ]
+            source = col_all if col_all else col_cut
+
+            tx0 = min(r[0] for r in source)
+            ty0 = min(r[1] for r in source)
+            tx1 = max(r[2] for r in source)
+            ty1 = max(r[3] for r in source)
+
+            result.append(_apply_padding((tx0, ty0, tx1, ty1), padding_pt, page_w, page_h))
+
+    return result
+
+
+def _recursive_split(
+    boxes: list[tuple],
+    current_gap: float,
+    depth: int,
+    *,
+    eff_text: list[tuple],
+    eff_draw: list[tuple],
+    all_rects: list[tuple],
+    padding_pt: float,
+    page_w: float,
+    page_h: float,
+) -> list[tuple]:
+    """너무 큰 region을 current_gap/2로 재귀 분할한다 (최대 _MAX_RECURSION_DEPTH 단계)."""
+    if depth >= _MAX_RECURSION_DEPTH or current_gap / 2 < 5.0 or len(boxes) < 2:
+        return boxes
+
+    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]
+    median_area = statistics.median(areas)
+    threshold = median_area * _OUTLIER_AREA_MULTIPLIER
+    next_gap = current_gap / 2
+
+    result: list[tuple] = []
+    for bbox, area in zip(boxes, areas):
+        if area > threshold:
+            sub = _detect_regions_in_area(
+                eff_text, eff_draw, all_rects,
+                bbox[0], bbox[1], bbox[2], bbox[3],
+                next_gap, padding_pt, page_w, page_h,
+            )
+            if len(sub) > 1:
+                result.extend(_recursive_split(
+                    sub, next_gap, depth + 1,
+                    eff_text=eff_text, eff_draw=eff_draw, all_rects=all_rects,
+                    padding_pt=padding_pt, page_w=page_w, page_h=page_h,
+                ))
+                continue
+        result.append(bbox)
+    return result
+
+
+def detect_content_regions(
+    pdf_path: str,
+    page_idx: int = 0,
+    min_gap_pt: float = 30.0,
+    padding_pt: float = 6.0,
+) -> list[dict]:
+    """
+    PyMuPDF 기반 whitespace 분석으로 콘텐츠 region 목록을 반환한다.
+
+    개선 사항:
+    - 방안 A: X-cuts 시 band 높이 80% 이상 rect를 로컬 배경으로 제거
+    - thin-rect 필터: Y-cuts에 높이 < min_gap*3, X-cuts에 너비 < min_gap*3인 드로잉 제외
+                     → connector/border 요소가 whitespace gap을 막는 문제 방지
+    - 방안 C: 너무 큰 region(중앙값 면적 4배 이상)을 min_gap/2로 재귀 분할
+    - fallback: text_rects가 없으면 drawing_rects를 text_rects 역할로 사용
+    """
     doc = fitz.open(pdf_path)
     page = doc[page_idx]
-    rect = page.rect
-    scale = min(max_px / rect.width, max_px / rect.height)
-    mat = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=mat)
-    img_bytes = pix.tobytes("jpeg")
-    del pix
+    page_w = page.rect.width
+    page_h = page.rect.height
+
+    text_rects = _collect_text_rects(page)
+    draw_rects = _collect_drawing_rects(page)
     doc.close()
-    return img_bytes
+
+    all_rects = text_rects + draw_rects
+
+    if not all_rects:
+        return []
+
+    # fallback: 텍스트 없는 PDF (이미지/드로잉 전용)
+    # drawing_rects를 tall(실질 콘텐츠)과 short(장식/선)로 분리하여
+    # tall → text_rects 역할, short → draw_rects 역할로 사용
+    # → thin_pt 필터가 draw_rects에만 적용되는 구조를 그대로 활용
+    if text_rects:
+        eff_text = text_rects
+        eff_draw = draw_rects
+    else:
+        thin_threshold = min_gap_pt * 3
+        eff_text = [r for r in draw_rects if (r[3] - r[1]) >= thin_threshold]
+        eff_draw = [r for r in draw_rects if (r[3] - r[1]) < thin_threshold]
+        if not eff_text:  # 모두 얇은 경우 전체 사용
+            eff_text = draw_rects
+            eff_draw = []
+
+    # ① 1차 탐지
+    bboxes = _detect_regions_in_area(
+        eff_text, eff_draw, all_rects,
+        0.0, 0.0, page_w, page_h,
+        min_gap_pt, padding_pt, page_w, page_h,
+    )
+
+    if not bboxes:
+        return []
+
+    # ② 재귀 분할 (방안 C)
+    final_bboxes = _recursive_split(
+        bboxes, min_gap_pt, depth=0,
+        eff_text=eff_text, eff_draw=eff_draw, all_rects=all_rects,
+        padding_pt=padding_pt, page_w=page_w, page_h=page_h,
+    )
+
+    # 중복 bbox 제거 (순서 유지)
+    seen: set[tuple] = set()
+    unique_bboxes: list[tuple] = []
+    for b in final_bboxes:
+        key = (
+            round(b[0], _BBOX_ROUND_PRECISION),
+            round(b[1], _BBOX_ROUND_PRECISION),
+            round(b[2], _BBOX_ROUND_PRECISION),
+            round(b[3], _BBOX_ROUND_PRECISION),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique_bboxes.append(b)
+
+    return [{"idx": i, "bbox_pt": list(b)} for i, b in enumerate(unique_bboxes)]
 
 
-def render_tile(
+def render_region(
     pdf_path: str,
-    cell_idx: int,
-    rows: int,
-    cols: int,
+    page_idx: int,
+    bbox_pt: list[float],
     dpi: int = 72,
-    page_idx: int = 0,
-    overlap: float = 0.0,
+    padding_pt: float = 6.0,
 ) -> bytes:
     """
-    그리드 셀 인덱스에 해당하는 영역을 고해상도로 렌더링하여 JPEG bytes 반환.
-    메모리 누수 방지를 위해 처리 후 즉시 해제.
+    bbox_pt([x0, y0, x1, y1])로 지정한 영역을 JPEG bytes로 렌더링한다.
+    padding_pt만큼 bbox를 확장하고 page 경계로 클램핑한다.
     """
     doc = fitz.open(pdf_path)
     page = doc[page_idx]
-    rect = page.rect
+    page_w = page.rect.width
+    page_h = page.rect.height
 
-    clip, _, _, _, _ = _calc_cell_clip(rect.width, rect.height, cell_idx, rows, cols, overlap)
+    clip = fitz.Rect(*_apply_padding(tuple(bbox_pt), padding_pt, page_w, page_h))
 
     mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = page.get_pixmap(matrix=mat, clip=clip)
+    pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
     img_bytes = pix.tobytes("jpeg")
 
     del pix
@@ -249,309 +415,3 @@ def render_tile(
     doc.close()
 
     return img_bytes
-
-
-def render_tile_as_pdf(
-    pdf_path: str,
-    cell_idx: int,
-    rows: int,
-    cols: int,
-    page_idx: int = 0,
-    overlap: float = 0.0,
-) -> bytes:
-    """
-    그리드 셀 영역을 Ghostscript로 최적화하여 PDF bytes 반환.
-
-    PyMuPDF로 cropbox를 설정한 중간 PDF를 생성한 뒤 Ghostscript로
-    재처리하여 해당 영역 밖의 이미지/폰트를 제거합니다.
-    시스템에 gs(Ghostscript)가 설치되어 있어야 합니다.
-    """
-    gs = shutil.which("gs")
-    if not gs:
-        raise RuntimeError("Ghostscript(gs)가 설치되어 있지 않습니다. brew install ghostscript")
-
-    doc = fitz.open(pdf_path)
-    page = doc[page_idx]
-    rect = page.rect
-
-    clip, _, _, _, _ = _calc_cell_clip(rect.width, rect.height, cell_idx, rows, cols, overlap)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        # 1단계: PyMuPDF로 cropbox 설정된 중간 PDF 생성
-        mid_path = Path(tmp) / "mid.pdf"
-        mid_doc = fitz.open()
-        mid_doc.insert_pdf(doc, from_page=page_idx, to_page=page_idx)
-        mid_doc[0].set_cropbox(clip)
-        mid_doc.save(str(mid_path))
-        mid_doc.close()
-        doc.close()
-
-        # 2단계: Ghostscript로 재처리 (미사용 리소스 제거 + 폰트 서브셋)
-        out_path = Path(tmp) / "out.pdf"
-        try:
-            subprocess.run(
-                [
-                    gs,
-                    "-sDEVICE=pdfwrite",
-                    "-dNOPAUSE", "-dBATCH", "-dQUIET",
-                    "-dSubsetFonts=true",
-                    "-dEmbedAllFonts=true",
-                    "-dCompressFonts=true",
-                    "-dDownsampleColorImages=false",
-                    "-dDownsampleGrayImages=false",
-                    "-dDownsampleMonoImages=false",
-                    f"-sOutputFile={out_path}",
-                    str(mid_path),
-                ],
-                check=True,
-                capture_output=True,
-            )
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr.decode(errors="replace").strip()
-            raise RuntimeError(
-                f"Ghostscript가 셀 {cell_idx} 처리에 실패했습니다.\n"
-                f"원인: {stderr or '알 수 없는 오류'}\n"
-                "대안: get_tile 도구를 사용하면 Ghostscript 없이 이미지로 추출할 수 있습니다."
-            ) from None
-
-        return out_path.read_bytes()
-
-
-def _words_in_rect(words: list, rx0: float, ry0: float, rx1: float, ry1: float, max_chars: int = 80) -> str:
-    """pdfplumber extract_words() 결과에서 주어진 rect 안의 단어를 조합하여 반환."""
-    result = []
-    total = 0
-    for w in words:
-        if w["x0"] < rx1 and w["x1"] > rx0 and w["top"] < ry1 and w["bottom"] > ry0:
-            result.append(w["text"])
-            total += len(w["text"]) + 1
-            if total >= max_chars:
-                break
-    return " ".join(result)
-
-
-def get_page_structure(
-    pdf_path: str,
-    rows: int,
-    cols: int,
-    page_idx: int = 0,
-    overlap: float = 0.0,
-    include_empty: bool = False,
-) -> dict:
-    """
-    셀별 텍스트/이미지 유무와 PDF 목차(TOC)를 반환한다.
-
-    각 셀에 대해 has_text, has_image, text_preview를 계산하여
-    LLM이 불필요한 get_tile 호출을 최소화할 수 있도록 한다.
-
-    overlap을 지정하면 get_tile/get_tile_text와 동일한 경계 확장 후 검사하므로
-    경계 근처 콘텐츠를 놓치지 않는다.
-
-    주의: toc의 page 필드는 PyMuPDF get_toc() 기준으로 1-indexed이다.
-    page_idx 파라미터(0-indexed)와 1 차이가 있으므로, TOC page 값을
-    page_idx로 사용하려면 1을 빼야 한다.
-    """
-    doc = fitz.open(pdf_path)
-    page = doc[page_idx]
-    page_w = page.rect.width
-    page_h = page.rect.height
-
-    blocks = page.get_text("dict")["blocks"]
-    toc = doc.get_toc()
-    doc.close()
-
-    tile_w = page_w / cols
-    tile_h = page_h / rows
-
-    # overlap padding 계산 (셀 크기 기준 평균값 사용)
-    pad_x = overlap * tile_w
-    pad_y = overlap * tile_h
-
-    # 셀 플래그 초기화
-    total_cells = rows * cols
-    cell_flags = [{"has_text": False, "has_image": False} for _ in range(total_cells)]
-
-    # ① 블록→셀 역방향 버케팅: 블록을 한 번만 순회하여 해당 셀 범위에 플래그 설정
-    for block in blocks:
-        bx0, by0, bx1, by1 = block["bbox"]
-        is_text = block["type"] == 0
-        is_image = block["type"] == 1
-
-        if not (is_text or is_image):
-            continue
-
-        # overlap을 고려하여 블록이 겹칠 수 있는 셀 범위 계산
-        col_start = max(0, int((bx0 - pad_x) / tile_w))
-        col_end   = min(cols - 1, int((bx1 + pad_x) / tile_w))
-        row_start = max(0, int((by0 - pad_y) / tile_h))
-        row_end   = min(rows - 1, int((by1 + pad_y) / tile_h))
-
-        for r in range(row_start, row_end + 1):
-            for c in range(col_start, col_end + 1):
-                cidx = r * cols + c
-                if is_text:
-                    cell_flags[cidx]["has_text"] = True
-                if is_image:
-                    cell_flags[cidx]["has_image"] = True
-
-    # ② pdfplumber를 1회만 열어 전체 단어 목록 추출
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            pl_words = pdf.pages[page_idx].extract_words()
-    except Exception:
-        pl_words = []
-
-    cells = {}
-    for cell_idx in range(total_cells):
-        flags = cell_flags[cell_idx]
-        has_text = flags["has_text"]
-        has_image = flags["has_image"]
-
-        cell_rect, _, _, _, _ = _calc_cell_clip(page_w, page_h, cell_idx, rows, cols, overlap)
-        text_preview = _words_in_rect(pl_words, cell_rect.x0, cell_rect.y0, cell_rect.x1, cell_rect.y1)
-
-        # pdfplumber words로 has_text 이중 검증 (PyMuPDF가 놓친 경우 보완)
-        if text_preview:
-            has_text = True
-
-        cells[cell_idx] = {
-            "has_text": has_text,
-            "has_image": has_image,
-            "text_preview": text_preview[:80].strip(),
-        }
-
-    if not include_empty:
-        cells = {k: v for k, v in cells.items() if v["has_text"] or v["has_image"]}
-
-    return {"cells": cells, "toc": toc}
-
-
-def extract_tile_text(
-    pdf_path: str,
-    cell_idx: int,
-    rows: int,
-    cols: int,
-    page_idx: int = 0,
-    overlap: float = 0.0,
-    format: str = "text",
-) -> dict:
-    """
-    그리드 셀 인덱스에 해당하는 영역의 텍스트를 추출하여 반환.
-    render_tile과 동일한 clip 계산 로직을 사용하므로 좌표가 일치합니다.
-    """
-    doc = fitz.open(pdf_path)
-    page = doc[page_idx]
-    rect = page.rect
-
-    clip, _, _, _, _ = _calc_cell_clip(rect.width, rect.height, cell_idx, rows, cols, overlap)
-
-    if format == "text":
-        # doc이 열린 상태에서 PyMuPDF 텍스트 미리 추출 (fallback용, 이중 open 방지)
-        fitz_text = page.get_text("text", clip=clip) or ""
-        doc.close()
-        text = _extract_text_clip(pdf_path, clip, page_idx)
-        if not text.strip():
-            text = fitz_text
-        return {
-            "text": text,
-            "cell_idx": cell_idx,
-            "clip_rect": [clip.x0, clip.y0, clip.x1, clip.y1],
-        }
-
-    # format == "compact": bbox는 fitz 유지, text는 pdfplumber로 추출
-    text_dict = page.get_text("dict", clip=clip)
-    # type=0: 텍스트 블록, type=1: 이미지 블록 (bytes 포함으로 JSON 직렬화 불가)
-    text_blocks = [b for b in text_dict.get("blocks", []) if b.get("type") == 0]
-
-    if not text_blocks:
-        # fallback: get_text("words") — 이미 열린 doc 재사용, 추가 I/O 없음
-        fitz_words = page.get_text("words", clip=clip)
-        doc.close()
-        compact_blocks = []
-        if fitz_words:
-            compact_blocks = [{
-                "bbox": [clip.x0, clip.y0, clip.x1, clip.y1],
-                "lines": [
-                    {"bbox": [w[0], w[1], w[2], w[3]],
-                     "spans": [{"text": w[4], "bbox": [w[0], w[1], w[2], w[3]]}]}
-                    for w in fitz_words
-                ],
-            }]
-        return {
-            "blocks": compact_blocks,
-            "cell_idx": cell_idx,
-            "clip_rect": [clip.x0, clip.y0, clip.x1, clip.y1],
-        }
-
-    doc.close()
-
-    # pdfplumber로 단어 단위 텍스트 추출 (bbox 기반 매핑용)
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            pl_page = pdf.pages[page_idx]
-            pl_words = pl_page.crop((clip.x0, clip.y0, clip.x1, clip.y1)).extract_words()
-    except Exception:
-        pl_words = []
-
-    def _find_word_text(span_bbox: tuple) -> str:
-        """span bbox와 겹치는 pdfplumber 단어들을 조합하여 반환."""
-        sx0, sy0, sx1, sy1 = span_bbox
-        matched_words = [
-            w["text"] for w in pl_words
-            if w["x0"] < sx1 and w["x1"] > sx0 and w["top"] < sy1 and w["bottom"] > sy0
-        ]
-        return " ".join(matched_words)
-
-    compact_blocks = []
-    for block in text_blocks:
-        compact_lines = []
-        for line in block.get("lines", []):
-            compact_spans = [
-                {"text": _find_word_text(s["bbox"]), "bbox": s["bbox"]}
-                for s in line.get("spans", [])
-            ]
-            compact_lines.append({"bbox": line["bbox"], "spans": compact_spans})
-        compact_blocks.append({"bbox": block["bbox"], "lines": compact_lines})
-
-    return {
-        "blocks": compact_blocks,
-        "cell_idx": cell_idx,
-        "clip_rect": [clip.x0, clip.y0, clip.x1, clip.y1],
-    }
-
-
-def search_cells(
-    pdf_path: str,
-    query: str,
-    rows: int,
-    cols: int,
-    page_idx: int = 0,
-    overlap: float = 0.0,
-    case_sensitive: bool = False,
-) -> dict:
-    """특정 문자열이 포함된 셀 번호 목록을 반환."""
-    doc = fitz.open(pdf_path)
-    page = doc[page_idx]
-    page_w = page.rect.width
-    page_h = page.rect.height
-    doc.close()
-
-    # pdfplumber를 1회만 열어 전체 단어 목록 추출
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            pl_words = pdf.pages[page_idx].extract_words()
-    except Exception:
-        pl_words = []
-
-    search_query = query if case_sensitive else query.lower()
-
-    matched = []
-    for cell_idx in range(rows * cols):
-        cell_rect, _, _, _, _ = _calc_cell_clip(page_w, page_h, cell_idx, rows, cols, overlap)
-        cell_text = _words_in_rect(pl_words, cell_rect.x0, cell_rect.y0, cell_rect.x1, cell_rect.y1, max_chars=10000)
-        if not case_sensitive:
-            cell_text = cell_text.lower()
-        if search_query in cell_text:
-            matched.append(cell_idx)
-
-    return {"query": query, "matched_cells": matched}
